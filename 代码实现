@@ -1,0 +1,134 @@
+import requests
+from queue import Queue
+import random
+from lxml import etree
+from pymongo import MongoClient
+import time
+import threading
+import re
+
+
+class Tianya(object):
+    """爬取天涯社区汽车频道文本，包括帖子内容和评论"""
+    def __init__(self):
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/72.0.3626.119 Safari/537.36 "
+        }
+        self.url = 'http://bbs.tianya.cn/list-cars-1.shtml'
+        self.next = Queue()
+        # 放置论坛每一条帖子
+        self.post_content = Queue()
+        self.post_url = Queue()
+        self.reply = Queue()
+        self.next = Queue()
+        self.next.put(self.url)
+        self.client = MongoClient(host="127.0.0.1",port=27017)
+
+    def getproxy(self):
+        """获得代理列表"""
+        proxies = self.client['proxy']['useful_proxy'].find()
+        proxies_list = []
+        for i in proxies:
+            proxy = {}
+            proxy['http'] = 'http://' + i['proxy']
+            proxies_list.append(proxy)
+        return proxies_list
+
+    def parse(self):
+        """弹出一个next_url，发送请求,得到每一条帖子的url以及下一页的url，并存入队列"""
+        while True:
+            next_url = self.next.get()
+            self.next.task_done()
+            proxy_list = self.getproxy()
+            response = requests.get(next_url,headers=self.headers)
+            html = etree.HTML(response.content)
+            tbody_list = html.xpath('//div[@class="mt5"]/table/tbody')
+            for tbody in tbody_list:
+                tr_list = tbody.xpath('./tr')
+                for tr in tr_list:
+                    post_url = tr.xpath('./td[1]/a/@href')
+                    if post_url:
+                        post_url = 'http://bbs.tianya.cn'+post_url[0]
+                        # 打印每一条帖子的url
+                        print(post_url)
+                        self.post_url.put(post_url)
+
+            # 获取下一页的url,并判断是否为空放入队列
+            next = html.xpath('//div[@class="links"]/a[text()="下一页"]/@href')
+            # print(next)
+            if next:
+                next_url = next[0]
+                next_url = 'http://bbs.tianya.cn'+next_url
+                # 打印每一个页面的url(这个页面有许多帖子构成)
+                print(next_url)
+                self.next.put(next_url)
+
+    def get_post_and_reply(self):
+        """弹出一个post_url，获得每条帖子的内容和评论"""
+        proxy_list = self.getproxy()
+        while True:
+            post_url = self.post_url.get()
+            self.post_url.task_done()
+            post = {}
+            try:
+                global proxy
+                proxy = random.choice(proxy_list)
+                # print(proxy)
+                response = requests.get(post_url,headers=self.headers,proxies=proxy)
+                html = etree.HTML(response.content)
+                post_title = html.xpath('//div[@id="post_head"]/h1[@class="atl-title"]/span[@class="s_title"]/span/text()')
+                if post_title:
+                    post['post_title'] = post_title[0]
+                post_content = html.xpath('//div[@class="atl-content"]/div[2]/div[1]/text()')
+                if post_content:
+                    # post['content'] 帖子内容加评论
+                    post['post_content'] = ''.join(post_content)
+                    post['post_content'] = re.sub(r'\s','',post['post_content'])
+                    post['post_content'] = re.sub(r'【|#|】', '', post['post_content'])
+                    post['post_content'] = re.sub(r'[[].*[]]','',post['post_content'])
+                else:
+                    post['post_content'] = '无内容'
+                # reply 帖子下面的评论
+                post['reply'] = html.xpath('//div[@class="atl-main"]/div[@class="atl-item"]/div[@class="atl-content"]//div[@class="bbs-content"]/text()')
+                post['reply'] = ''.join(post['reply'])
+                post['reply'] = re.sub(r'\s','',post['reply'])
+
+                # 判断，如果存在post_title就取它的title节点，如果不存在就取它的text节点
+                if post['post_title'] is None:
+                    post['post_title'] = html.xpath('//*[@id="aid_0"]/div[1]')
+                # 打印每一条帖子的内容
+                print(post)
+                print('*'*100)
+
+            except Exception as a:
+                a = str(a)
+                print(a)
+                # 如果抛出异常说明代理ip有问题，删除数据库中该有问题的代理
+                if a.startswith('HTTPConnectionPool') is True:
+                    # self.client['proxy']['useful_proxy'].delete_one({'proxy':proxy['http'][7:]})
+                    print('ip地址无效')
+
+    def run(self):
+        """主程序入口,给了40个线程执行"""
+        t = []
+        for i in range(10):
+            t1 = threading.Thread(target=self.parse)
+            t.append(t1)
+
+        for i in range(10):
+            t2 = threading.Thread(target=self.get_post_and_reply)
+            t.append(t2)
+
+        # for i in range(15):
+        #     t3 = threading.Thread(target=self.save)
+        #     t.append(t3)
+
+        for thread in t:
+            thread.start()
+
+
+if __name__ == "__main__":
+    t = Tianya()
+    t.run()
+
